@@ -2,7 +2,12 @@ name: Sync hosts file from upstream
 
 # Pulls ONLY the `hosts` file from StevenBlack/hosts, keeps your custom records,
 # and commits it to this fork only if every domain points to 0.0.0.0.
-# Otherwise nothing is committed and you get an email with the offending lines.
+#
+# Notifications are GitHub issues in this repo (GitHub emails them to you):
+#   - "hosts merged"        -> opened (and closed right away) after each update
+#   - "hosts merge blocked" -> opened when non-0.0.0.0 entries are found;
+#                              closed automatically after the next good merge
+# No SMTP server or secrets needed.
 
 on:
   schedule:
@@ -11,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: sync-hosts
@@ -19,6 +25,9 @@ concurrency:
 env:
   UPSTREAM_REPO: StevenBlack/hosts
   UPSTREAM_BRANCH: master
+  GH_TOKEN: ${{ github.token }}
+  OWNER: ${{ github.repository_owner }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
   sync:
@@ -50,37 +59,73 @@ jobs:
             "$RUNNER_TEMP/candidate_hosts" "$RUNNER_TEMP/report.txt"
 
       - name: Commit hosts file
+        id: commit
         run: |
           cp "$RUNNER_TEMP/candidate_hosts" hosts
           if git diff --quiet -- hosts; then
             echo "hosts is already up to date."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          stats=$(git diff --numstat -- hosts | awk '{print "+" $1 " / -" $2 " lines"}')
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add hosts
           git commit -m "Sync hosts from ${UPSTREAM_REPO}@${{ steps.fetch.outputs.sha }}"
           git push
+          echo "stats=$stats" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare failure report
+      - name: Notify - merged
+        if: steps.commit.outputs.changed == 'true'
+        run: |
+          sha="${{ steps.fetch.outputs.sha }}"
+          commit="${{ steps.commit.outputs.commit }}"
+          {
+            echo "@${OWNER} the hosts file was merged from ${UPSTREAM_REPO}."
+            echo ""
+            echo "- Upstream commit: https://github.com/${UPSTREAM_REPO}/commit/${sha}"
+            echo "- Change: ${{ steps.commit.outputs.stats }}"
+            echo "- $(tail -n 1 "$RUNNER_TEMP/report.txt")"
+            echo "- Commit: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${commit}"
+          } > "$RUNNER_TEMP/merged.md"
+          gh label create hosts-merged --color 2da44e --force >/dev/null
+          url=$(gh issue create --title "hosts merged ($(date -u +%F))" \
+                  --label hosts-merged --body-file "$RUNNER_TEMP/merged.md")
+          gh issue close "$url" --reason completed
+          # A good merge resolves any open "blocked" issue.
+          for n in $(gh issue list --state open --label hosts-blocked --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Resolved: a clean upstream version was merged in ${commit}."
+          done
+
+      - name: Notify - blocked / failed
         if: failure()
         run: |
-          if [ "${{ steps.check.outcome }}" != "failure" ] || [ ! -s "$RUNNER_TEMP/report.txt" ]; then
-            echo "The hosts sync failed before/after the 0.0.0.0 check. See the run log." > "$RUNNER_TEMP/report.txt"
+          sha="${{ steps.fetch.outputs.sha }}"
+          {
+            echo "@${OWNER} the hosts file was **not** merged."
+            echo ""
+            echo "Upstream commit: \`${sha:-unknown}\`"
+            echo ""
+            if [ "${{ steps.check.outcome }}" = "failure" ] && [ -s "$RUNNER_TEMP/report.txt" ]; then
+              echo '```'
+              cat "$RUNNER_TEMP/report.txt"
+              echo '```'
+            else
+              echo "The workflow failed for another reason (not the 0.0.0.0 check)."
+            fi
+            echo ""
+            echo "Run log: ${RUN_URL}"
+          } > "$RUNNER_TEMP/blocked.md"
+          gh label create hosts-blocked --color d73a4a --force >/dev/null
+          open=$(gh issue list --state open --label hosts-blocked --json number --jq '.[0].number // empty')
+          if [ -z "$open" ]; then
+            gh issue create --title "hosts merge blocked" \
+              --label hosts-blocked --body-file "$RUNNER_TEMP/blocked.md"
+          elif [ -n "$sha" ] && gh issue view "$open" --json body,comments \
+                 --jq '[.body, .comments[].body] | join("\n")' | grep -q "$sha"; then
+            echo "Issue #$open already reports upstream $sha; not notifying again."
+          else
+            gh issue comment "$open" --body-file "$RUNNER_TEMP/blocked.md"
           fi
-          printf '\nRun log: %s/%s/actions/runs/%s\n' \
-            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$RUNNER_TEMP/report.txt"
-
-      - name: Email me
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          secure: true
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          from: GitHub hosts sync <${{ secrets.SMTP_USERNAME }}>
-          to: ${{ secrets.NOTIFY_EMAIL }}
-          subject: "[${{ github.repository }}] hosts merge blocked"
-          body: file://${{ runner.temp }}/report.txt
