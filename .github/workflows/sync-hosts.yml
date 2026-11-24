@@ -1,0 +1,86 @@
+name: Sync hosts file from upstream
+
+# Pulls ONLY the `hosts` file from StevenBlack/hosts, keeps your custom records,
+# and commits it to this fork only if every domain points to 0.0.0.0.
+# Otherwise nothing is committed and you get an email with the offending lines.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # daily at 03:17 UTC
+  workflow_dispatch:        # "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-hosts
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: StevenBlack/hosts
+  UPSTREAM_BRANCH: master
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+
+      - name: Download upstream hosts file
+        id: fetch
+        run: |
+          sha=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/heads/${UPSTREAM_BRANCH}" | cut -f1)
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          curl -fsSL --retry 3 \
+            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${sha}/hosts" \
+            -o "$RUNNER_TEMP/upstream_hosts"
+          echo "Upstream commit: $sha ($(wc -l < "$RUNNER_TEMP/upstream_hosts") lines)"
+
+      - name: Build candidate (upstream + your custom records)
+        run: |
+          python3 .github/scripts/hosts_sync.py merge \
+            hosts "$RUNNER_TEMP/upstream_hosts" "$RUNNER_TEMP/candidate_hosts"
+
+      - name: Verify every domain points to 0.0.0.0
+        id: check
+        run: |
+          python3 .github/scripts/hosts_sync.py check \
+            "$RUNNER_TEMP/candidate_hosts" "$RUNNER_TEMP/report.txt"
+
+      - name: Commit hosts file
+        run: |
+          cp "$RUNNER_TEMP/candidate_hosts" hosts
+          if git diff --quiet -- hosts; then
+            echo "hosts is already up to date."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add hosts
+          git commit -m "Sync hosts from ${UPSTREAM_REPO}@${{ steps.fetch.outputs.sha }}"
+          git push
+
+      - name: Prepare failure report
+        if: failure()
+        run: |
+          if [ "${{ steps.check.outcome }}" != "failure" ] || [ ! -s "$RUNNER_TEMP/report.txt" ]; then
+            echo "The hosts sync failed before/after the 0.0.0.0 check. See the run log." > "$RUNNER_TEMP/report.txt"
+          fi
+          printf '\nRun log: %s/%s/actions/runs/%s\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$RUNNER_TEMP/report.txt"
+
+      - name: Email me
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          secure: true
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: GitHub hosts sync <${{ secrets.SMTP_USERNAME }}>
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          subject: "[${{ github.repository }}] hosts merge blocked"
+          body: file://${{ runner.temp }}/report.txt
